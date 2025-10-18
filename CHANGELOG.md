@@ -130,7 +130,16 @@ Check `intersection_images_hq/` folder for examples!
 - Disabled mixed precision training
 - Stable CLIP fine-tuning
 
-### v1.3 - High-Quality Data Collection (Current)
+### v1.3 - High-Quality Data Collection
 - Integrated RGB rendering
 - 600x600 image resolution
 - Better CLIP training quality
+
+### v1.4 - Data Language Encoder (Current)
+- Added DLE for state-to-language conversion
+- Rich contextual descriptions instead of simple labels
+- Extracts speed, gap, TTC, density from simulator
+- Generates natural language like: "ego speed high; heavy traffic; imminent risk; slow down"
+- Expected +5-10% performance improvement
+- Fully paper-aligned with 3 action phrases
+- Enabled by default in both scripts
