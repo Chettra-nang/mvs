@@ -158,16 +158,29 @@ CLIP_BATCH_SIZE = 16  # instead of 32
 # Uses FP32 training to avoid gradient issues
 ```
 
-**3. CLIP Rewards showing NaN**
+**3. CLIP Rewards showing 0.0000 or NaN**
 ```bash
-# Check CLIP model loading
-# Verify image preprocessing pipeline
+# FIXED in v1.5!
+# - Lowered threshold from 0.6 to 0.3
+# - Added debugging output
+# - Should now see: "CLIP Stats: X/Y (30-50% apply rate)"
 ```
 
 **4. Low Success Rates**
 ```bash
-# Normal for intersection environment
-# Try adjusting reward weights or thresholds
+# FIXED in v1.5!
+# - Increased from 8K to 50K timesteps
+# - Should now see 5-15% success (vs 0%)
+# - For production: use RTX 5090 version with 1M timesteps
+```
+
+**5. How to verify CLIP is working**
+```bash
+# Look for these messages during training:
+✓ CLIP reward applied: r_clip=0.523, prob=0.412
+CLIP Stats: 342/1000 (34.2% apply rate)
+
+# If you see 0% apply rate, threshold may need adjustment
 ```
 
 ## 📁 Project Structure
