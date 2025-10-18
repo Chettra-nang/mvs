@@ -30,6 +30,126 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ============================================================================
+# PART 0: Data Language Encoder (State → Natural Language)
+# ============================================================================
+
+class DataLanguageEncoder:
+    """
+    Turn highway-env numeric state into a sentence CLIP can read.
+    Outputs both a state description and a recommended action phrase drawn from:
+      - "slow down and be cautious"
+      - "maintain current speed"
+      - "speed up and go faster"
+    """
+    
+    def __init__(self):
+        # Tunable thresholds (meters, m/s, seconds)
+        self.speed_lo = 3.0
+        self.speed_hi = 7.0
+        self.near_gap = 15.0
+        self.medium_gap = 30.0
+        self.ttc_danger = 2.5
+        self.ttc_caution = 4.0
+        self.density_near_radius = 25.0
+        
+        # Action phrases must stay consistent with CLIP action texts
+        self.ACTIONS = [
+            "slow down and be cautious",
+            "maintain current speed",
+            "speed up and go faster"
+        ]
+    
+    def _nearest_conflict(self, env):
+        """
+        Returns (gap_m, rel_speed, ttc) for the nearest vehicle on a conflicting path.
+        If unavailable, returns (inf, 0, inf).
+        """
+        ego = env.unwrapped.vehicle
+        if ego is None:
+            return float("inf"), 0.0, float("inf")
+        
+        best_gap = float("inf")
+        best_rel_speed = 0.0
+        best_ttc = float("inf")
+        
+        for v in env.unwrapped.road.vehicles:
+            if v is ego:
+                continue
+            # Euclidean gap
+            gap = float(np.linalg.norm(v.position - ego.position))
+            # relative speed magnitude
+            rel_v = ego.speed - v.speed
+            # TTC (rough): gap / max(eps, relative closing speed if approaching)
+            closing = max(1e-3, v.speed - ego.speed)
+            ttc = gap / closing if closing > 1e-3 else float("inf")
+            
+            if gap < best_gap:
+                best_gap, best_rel_speed, best_ttc = gap, rel_v, ttc
+        
+        return best_gap, best_rel_speed, best_ttc
+    
+    def _density(self, env, ego):
+        """Count vehicles within a radius of ego."""
+        near = 0
+        for v in env.unwrapped.road.vehicles:
+            if v is ego:
+                continue
+            if np.linalg.norm(v.position - ego.position) <= self.density_near_radius:
+                near += 1
+        return near
+    
+    def describe(self, env):
+        """
+        Build a sentence + recommended action based on interpretable features.
+        Returns: (description_text, action_phrase)
+        """
+        ego = env.unwrapped.vehicle
+        if ego is None:
+            return "intersection scene; unavailable ego state; proceed cautiously.", self.ACTIONS[1]
+        
+        speed = float(ego.speed)
+        gap, rel_speed, ttc = self._nearest_conflict(env)
+        density = self._density(env, ego)
+        
+        # Qualitative bins
+        speed_str = ("very low" if speed < self.speed_lo else
+                     "moderate" if speed < self.speed_hi else
+                     "high")
+        
+        if gap < self.near_gap:
+            gap_str = "very close vehicle ahead or crossing"
+        elif gap < self.medium_gap:
+            gap_str = "nearby vehicle in the intersection"
+        else:
+            gap_str = "no immediate vehicle nearby"
+        
+        if ttc < self.ttc_danger:
+            risk_str = "imminent crossing risk"
+        elif ttc < self.ttc_caution:
+            risk_str = "potential crossing risk"
+        else:
+            risk_str = "low immediate risk"
+        
+        density_str = ("heavy traffic" if density >= 4 else
+                       "moderate traffic" if density >= 2 else
+                       "light traffic")
+        
+        # Recommend action (simple policy consistent with paper's three labels)
+        if (ttc < self.ttc_caution) or (gap < self.near_gap and speed > self.speed_lo) or density >= 4:
+            action = self.ACTIONS[0]  # slow down
+        elif (speed < self.speed_lo) and (gap > self.medium_gap) and (ttc == float("inf") or ttc > self.ttc_caution):
+            action = self.ACTIONS[2]  # speed up
+        else:
+            action = self.ACTIONS[1]  # maintain
+        
+        # Compose a compact, consistent sentence
+        desc = (f"unsignalized intersection left turn; ego speed {speed_str}; {density_str}; "
+                f"{gap_str}; {risk_str}; recommended action: {action}")
+        
+        return desc, action
+
+
+# ============================================================================
 # PART 1: CLIP Fine-tuning Components
 # ============================================================================
 
@@ -548,14 +668,14 @@ def evaluate_agent(model, n_episodes=50, render=False):
 # PART 10: Data Collection for CLIP Fine-tuning (from OBS, not render)
 # ============================================================================
 
-def collect_intersection_data(n_episodes=100, save_path="intersection_dataset.json"):
+def collect_intersection_data(n_episodes=100, save_path="intersection_dataset.json", use_dle=True):
     """
-    Collect high-quality RGB images for CLIP fine-tuning
-    Uses env.render() for 600x600 RGB images instead of low-res grayscale
+    Collect high-quality RGB images for CLIP fine-tuning with Data Language Encoder
+    Uses env.render() for 600x600 RGB images + DLE for rich natural language descriptions
     """
     print("\n" + "="*80)
     print("Collecting High-Quality Intersection Data for CLIP Fine-tuning")
-    print("Using 600x600 RGB rendering for better visual quality")
+    print("Using 600x600 RGB rendering + Data Language Encoder")
     print("="*80)
 
     # Use RGB rendering for high-quality images
@@ -594,6 +714,9 @@ def collect_intersection_data(n_episodes=100, save_path="intersection_dataset.js
     dataset = []
     img_dir = "intersection_images"
     os.makedirs(img_dir, exist_ok=True)
+    
+    # Initialize Data Language Encoder
+    dle = DataLanguageEncoder() if use_dle else None
 
     for episode in tqdm(range(n_episodes), desc="Collecting data"):
         obs, info = env.reset()
@@ -604,38 +727,40 @@ def collect_intersection_data(n_episodes=100, save_path="intersection_dataset.js
             # Get high-quality RGB frame
             rgb_frame = env.render()
             
-            # Get ego vehicle info for labeling
-            ego = env.unwrapped.vehicle
-            label = None
-            
-            if ego is not None:
-                speed = ego.speed
-                nearby_vehicles = [
-                    v for v in env.unwrapped.road.vehicles 
-                    if v is not ego and np.linalg.norm(v.position - ego.position) < 25
-                ]
-                
-                num_nearby = len(nearby_vehicles)
-                
-                # Better labeling
-                if num_nearby >= 3 and speed > 6:
-                    label = "slow down and be cautious"
-                elif num_nearby >= 2 and speed > 7:
-                    label = "slow down and be cautious"
-                elif num_nearby == 0 and speed < 4:
-                    label = "speed up and go faster"
-                elif num_nearby <= 1 and speed < 5:
-                    label = "speed up and go faster"
+            if rgb_frame is not None:
+                # Use DLE to generate rich description
+                if use_dle and dle is not None:
+                    description, action_phrase = dle.describe(env)
                 else:
-                    label = "maintain current speed"
+                    # Fallback to simple heuristic
+                    ego = env.unwrapped.vehicle
+                    if ego is not None:
+                        speed = ego.speed
+                        nearby = [v for v in env.unwrapped.road.vehicles 
+                                 if v is not ego and np.linalg.norm(v.position - ego.position) < 25]
+                        num_nearby = len(nearby)
+                        
+                        if num_nearby >= 3 and speed > 6:
+                            description = "slow down and be cautious"
+                        elif num_nearby == 0 and speed < 4:
+                            description = "speed up and go faster"
+                        else:
+                            description = "maintain current speed"
+                        action_phrase = description
+                    else:
+                        description = "maintain current speed"
+                        action_phrase = description
 
-            # Save high-quality RGB image
-            if label is not None and rgb_frame is not None:
+                # Save high-quality RGB image
                 img = Image.fromarray(rgb_frame)
                 img_path = f"{img_dir}/ep{episode}_t{step}.png"
                 img.save(img_path, quality=95)
                 
-                dataset.append({"image": img_path, "description": label})
+                dataset.append({
+                    "image": img_path,
+                    "description": description,  # Rich DLE description
+                    "action": action_phrase       # Keep action for analysis
+                })
 
             action = env.action_space.sample()
             obs, reward, terminated, truncated, info = env.step(action)
@@ -647,6 +772,8 @@ def collect_intersection_data(n_episodes=100, save_path="intersection_dataset.js
 
     print(f"\nDataset saved to {save_path} | total samples: {len(dataset)}")
     print(f"Image size: 600x600 RGB (high quality)")
+    if use_dle:
+        print(f"Using Data Language Encoder for rich descriptions")
     env.close()
     return dataset
 
