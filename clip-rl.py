@@ -548,67 +548,93 @@ def evaluate_agent(model, n_episodes=50, render=False):
 # PART 10: Data Collection for CLIP Fine-tuning (from OBS, not render)
 # ============================================================================
 
-def _obs_frame_to_rgb_pil(obs_last_uint8):
-    # obs_last_uint8 is (H,W) uint8; replicate to 3ch for CLIP preprocess
-    img = Image.fromarray(obs_last_uint8)
-    return Image.merge("RGB", (img, img, img))
-
 def collect_intersection_data(n_episodes=100, save_path="intersection_dataset.json"):
     """
-    Collect (image, description) pairs using stable, high-precision heuristics.
-    Saves the LAST grayscale observation frame (not env.render()) as 3ch PNG.
+    Collect high-quality RGB images for CLIP fine-tuning
+    Uses env.render() for 600x600 RGB images instead of low-res grayscale
     """
     print("\n" + "="*80)
-    print("Collecting Intersection Data for CLIP Fine-tuning")
+    print("Collecting High-Quality Intersection Data for CLIP Fine-tuning")
+    print("Using 600x600 RGB rendering for better visual quality")
     print("="*80)
 
-    env = gym.make("intersection-v1", render_mode=None)
+    # Use RGB rendering for high-quality images
+    env = gym.make("intersection-v1", render_mode="rgb_array")
     env.unwrapped.config.update({
         "observation": {
-            "type": "GrayscaleObservation",
-            "observation_shape": (128, 64),
-            "stack_size": 4,
-            "weights": [0.2989, 0.5870, 0.1140],
+            "type": "Kinematics",
+            "vehicles_count": 15,
+            "features": ["presence", "x", "y", "vx", "vy", "cos_h", "sin_h"],
+            "absolute": False,
         },
-        "action": {"type": "DiscreteMetaAction", "lateral": False, "longitudinal": True},
+        "action": {
+            "type": "DiscreteMetaAction",
+            "lateral": False,
+            "longitudinal": True,
+        },
         "duration": 30,
         "simulation_frequency": 15,
+        "policy_frequency": 5,
         "initial_vehicle_count": 5,
-        "spawn_probability": 0.2,
+        "spawn_probability": 0.3,
+        "collision_reward": -5,
+        "arrived_reward": 2,
+        "high_speed_reward": 1,
+        "reward_speed_range": [7.0, 9.0],
+        "normalize_reward": False,
+        "offroad_terminal": False,
+        # High-quality rendering
+        "screen_width": 600,
+        "screen_height": 600,
+        "centering_position": [0.3, 0.5],
+        "scaling": 5.5,
+        "show_trajectories": False,
     })
-    env.reset()
+    
     dataset = []
     img_dir = "intersection_images"
     os.makedirs(img_dir, exist_ok=True)
 
     for episode in tqdm(range(n_episodes), desc="Collecting data"):
         obs, info = env.reset()
-        done, step = False, 0
-        while not done:
-            # derive label (conservative heuristic)
+        done = False
+        step = 0
+        
+        while not done and step < 100:
+            # Get high-quality RGB frame
+            rgb_frame = env.render()
+            
+            # Get ego vehicle info for labeling
             ego = env.unwrapped.vehicle
             label = None
+            
             if ego is not None:
                 speed = ego.speed
-                near = [v for v in env.unwrapped.road.vehicles if v is not ego
-                        and np.linalg.norm(v.position - ego.position) < 20]
-                if len(near) >= 2 and speed > 5:
+                nearby_vehicles = [
+                    v for v in env.unwrapped.road.vehicles 
+                    if v is not ego and np.linalg.norm(v.position - ego.position) < 25
+                ]
+                
+                num_nearby = len(nearby_vehicles)
+                
+                # Better labeling
+                if num_nearby >= 3 and speed > 6:
                     label = "slow down and be cautious"
-                elif speed < 3 and len(near) == 0:
+                elif num_nearby >= 2 and speed > 7:
+                    label = "slow down and be cautious"
+                elif num_nearby == 0 and speed < 4:
+                    label = "speed up and go faster"
+                elif num_nearby <= 1 and speed < 5:
                     label = "speed up and go faster"
                 else:
                     label = "maintain current speed"
 
-            last = obs[-1] if obs.ndim == 3 else obs
-            if last.max() <= 1.0:
-                last_u8 = (last * 255).astype(np.uint8)
-            else:
-                last_u8 = last.astype(np.uint8)
-
-            if label is not None:
-                img = _obs_frame_to_rgb_pil(last_u8)
+            # Save high-quality RGB image
+            if label is not None and rgb_frame is not None:
+                img = Image.fromarray(rgb_frame)
                 img_path = f"{img_dir}/ep{episode}_t{step}.png"
-                img.save(img_path)
+                img.save(img_path, quality=95)
+                
                 dataset.append({"image": img_path, "description": label})
 
             action = env.action_space.sample()
@@ -620,6 +646,7 @@ def collect_intersection_data(n_episodes=100, save_path="intersection_dataset.js
         json.dump(dataset, f, indent=2)
 
     print(f"\nDataset saved to {save_path} | total samples: {len(dataset)}")
+    print(f"Image size: 600x600 RGB (high quality)")
     env.close()
     return dataset
 
