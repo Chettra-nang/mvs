@@ -358,11 +358,13 @@ class CLIPRewardModel:
 
 class CLIPRewardWrapper(gym.Wrapper):
     """Add CLIP reward only when action == CLIP suggestion and prob ≥ threshold."""
-    def __init__(self, env, clip_reward_model, weight_clip=1.2, prob_threshold=0.6):
+    def __init__(self, env, clip_reward_model, weight_clip=1.2, prob_threshold=0.3):
         super().__init__(env)
         self.rm = clip_reward_model
         self.weight_clip = weight_clip
         self.prob_threshold = prob_threshold
+        self.clip_reward_count = 0
+        self.total_steps = 0
 
     def step(self, action):
         obs, r_env, terminated, truncated, info = self.env.step(action)
@@ -372,10 +374,16 @@ class CLIPRewardWrapper(gym.Wrapper):
             r_clip, suggested, prob = self.rm.score(frame)
         except Exception as e:
             r_clip, suggested, prob = 0.0, action, 0.0
+            if self.total_steps < 5:
+                print(f"CLIP score error: {e}")
 
+        self.total_steps += 1
+        
+        # gate shaping with lower threshold
         if (int(action) == int(suggested)) and (prob >= self.prob_threshold) and np.isfinite(r_clip):
             r_total = float(r_env) + self.weight_clip * float(r_clip)
             info['clip_applied'] = True
+            self.clip_reward_count += 1
         else:
             r_total = float(r_env)
             info['clip_applied'] = False
@@ -386,6 +394,12 @@ class CLIPRewardWrapper(gym.Wrapper):
             'suggested_action': int(suggested),
             'base_reward': float(r_env)
         })
+        
+        # Periodic summary
+        if self.total_steps % 10000 == 0:
+            apply_rate = 100.0 * self.clip_reward_count / max(1, self.total_steps)
+            print(f"CLIP Stats: {self.clip_reward_count}/{self.total_steps} steps ({apply_rate:.1f}% apply rate)")
+        
         return obs, r_total, terminated, truncated, info
 
     def _get_frame_from_obs(self, obs):
@@ -509,7 +523,7 @@ def create_intersection_env(use_clip_reward=True, clip_reward_model=None, seed=4
         env = Monitor(env)
 
         if use_clip_reward and (clip_reward_model is not None):
-            env = CLIPRewardWrapper(env, clip_reward_model, weight_clip=1.2, prob_threshold=0.6)
+            env = CLIPRewardWrapper(env, clip_reward_model, weight_clip=1.2, prob_threshold=0.3)
         return env
     return make_env
 
