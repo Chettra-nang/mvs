@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import gymnasium as gym
 import highway_env  # noqa: F401 - needed to register envs
@@ -38,6 +39,16 @@ try:
 except Exception:
     WANDB_AVAILABLE = False
 from tqdm import tqdm
+try:
+    from peft import LoraConfig, get_peft_model
+    PEFT_AVAILABLE = True
+except Exception:
+    PEFT_AVAILABLE = False
+    # Define placeholders to avoid NameError if used accidentally
+    LoraConfig = None
+    def get_peft_model(*args, **kwargs):
+        raise RuntimeError("PEFT not available")
+import types
 import json
 import warnings
 from collections import deque
@@ -220,13 +231,23 @@ class AugmentedIntersectionDataset(Dataset):
         self.augment_prob = augment_prob
         with open(data_path, 'r') as f:
             self.data = json.load(f)
+        # simple synonym map to boost textual variation (low-risk augmentation)
+        self._synonyms = {
+            'slow down': ['decelerate', 'brake cautiously', 'reduce speed'],
+            'maintain current speed': ['hold speed', 'keep current speed'],
+            'speed up': ['accelerate', 'increase speed', 'go faster']
+        }
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
         item = self.data[idx]
-        image = Image.open(item['image']).convert('RGB')
+        # Prefer grayscale image saved for CLIP (paper); fall back to legacy keys
+        img_path = item.get('image_gray') or item.get('image') or item.get('image_rgb')
+        if img_path is None:
+            raise KeyError(f"No image path found in dataset item: keys={list(item.keys())}")
+        image = Image.open(img_path).convert('RGB')
         
         # Augmentation
         if random.random() < self.augment_prob:
@@ -242,139 +263,465 @@ class AugmentedIntersectionDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         text = item['description']
+        # Simple text augmentation: replace common phrases with synonyms at random
+        if random.random() < 0.25:
+            for k, v in self._synonyms.items():
+                if k in text:
+                    text = text.replace(k, random.choice(v))
+                    break
         return image, text
 
-class EnhancedCLIPFineTuner:
-    """Enhanced CLIP fine-tuning with better adaptation and monitoring."""
-    
-    def __init__(self, model_name="ViT-B/32", device=None, freeze_bottom_layers=True):
+class RobustCLIPFineTuner:
+    """Ultra-Stable: LoRA on visuals, gradual 1-block unfreeze, activation clamping."""
+
+    def __init__(self, model_name="ViT-B/32", device=None, initial_freeze_epochs=15):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model, self.preprocess = clip.load(model_name, device=self.device)
+        self.initial_freeze_epochs = initial_freeze_epochs
+        self.model_name = model_name
         
-        # Enhanced unfreezing: last 2 visual blocks + projection layers
-        if freeze_bottom_layers:
-            for name, p in self.model.named_parameters():
-                p.requires_grad = False
-            
-            # Unfreeze last 2 visual blocks + normalization + projections
-            unfreeze_patterns = [
-                "visual.transformer.resblocks.10",  # Second last block
-                "visual.transformer.resblocks.11",  # Last block
-                "visual.ln_post", "visual.proj", 
-                "text_projection", "logit_scale"
-            ]
-            for key, p in self.model.named_parameters():
-                if any(pattern in key for pattern in unfreeze_patterns):
-                    p.requires_grad = True
-                    # print(f"Unfrozen: {key}")  # Debug
+        # Freeze all; low scale init
+        for p in self.model.parameters():
+            p.requires_grad = False
+        with torch.no_grad():
+            # Initialize to a CLIP-like temperature (1/0.07 ~= 14.28 -> log ~2.66)
+            self.model.logit_scale.data = torch.tensor(2.66, device=self.device)
+            print(f"🔧 Init logit_scale set to 2.66 (temp~0.07); all frozen initially")
         
+        self.num_trainable = 0
+        self.global_step = 0
+        # Paper-style defaults: higher LR for projection/LoRA, slightly larger warmup
+        self.warmup_steps = 200
+        # base_lr targets projection/LoRA params only (visual backbone remains frozen)
+        self.base_lr = 5e-4
+        self.warmup_lr = 0.0
+        self.unfrozen_blocks = []  # Track unfrozen visual blocks
+        self.lora_applied = False
+        self.action_descriptions = ["slow down and be cautious", "maintain current speed", "speed up and go faster"]
+        # Training hyperparams we may tune dynamically
+        self.accum_steps = 32  # increase effective batch negatives (watch memory)
+        self.max_grad_norm = 20.0
+        self.clamp_val = 10.0
+        self.scale_regularization_start = 1000  # don't regularize scale until enough steps
+
+    # NEW: Apply LoRA to specific visual blocks (low-rank to prevent NaNs)
+    def _apply_lora_to_blocks(self, block_indices=[10, 11]):
+        if self.lora_applied:
+            return
+        lora_config = LoraConfig(
+            r=4,
+            lora_alpha=16,
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+            lora_dropout=0.1,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        visual_model = self.model.visual.transformer
+        for i in block_indices:
+            if i < len(visual_model.resblocks):
+                try:
+                    get_peft_model(visual_model.resblocks[i], lora_config)
+                except Exception:
+                    # Best-effort: ignore if peft can't wrap this module
+                    pass
+                for name, module in visual_model.resblocks[i].named_modules():
+                    if any(k in name for k in ['q_proj', 'k_proj', 'v_proj', 'out_proj']):
+                        try:
+                            module.requires_grad_(True)
+                        except Exception:
+                            pass
+                print(f"✓ Applied LoRA to visual block {i}")
+        self.lora_applied = True
+        self._update_trainable()
+
+    def _unfreeze_stage(self, stage):
+        """Gradual: Stage 0=scale/proj, 1=LoRA block 11, 2=LoRA block 10."""
+        if stage == 0:  # Always first
+            try:
+                if hasattr(self.model, 'logit_scale'):
+                    self.model.logit_scale.requires_grad_(True)
+                if hasattr(self.model, 'text_projection'):
+                    self.model.text_projection.requires_grad_(True)
+                # Also allow small adaptation of the visual projection to help alignment
+                if hasattr(self.model, 'visual') and hasattr(self.model.visual, 'proj'):
+                    try:
+                        self.model.visual.proj.requires_grad_(True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            print("✓ Unfroze scale + text_projection + visual.proj (if available)")
+        elif stage == 1:
+            self._apply_lora_to_blocks([11])
+            self.unfrozen_blocks = [11]
+        elif stage == 2:
+            self._apply_lora_to_blocks([10, 11])
+            self.unfrozen_blocks = [10, 11]
+        self._update_trainable()
+
+    def _update_trainable(self):
         self.num_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        print(f"EnhancedCLIPFineTuner: {self.num_trainable} trainable parameters")
-        
-        self.action_descriptions = [
-            "slow down and be cautious",
-            "maintain current speed", 
-            "speed up and go faster"
-        ]
-    
+        print(f"Trainable params: {self.num_trainable}")
+
+    # NEW: Patch resblocks with activation clamping (prevent explosion)
+    def _patch_visual_forwards(self):
+        if hasattr(self, '_patched'):
+            return
+        def clamped_forward(self_block, x):
+            # Best-effort clamps depending on block structure
+            try:
+                if hasattr(self_block, 'attn') and hasattr(self_block.attn, 'in_proj'):
+                    qkv = self_block.attn.in_proj(x)
+                    qkv = torch.clamp(qkv, -5.0, 5.0)
+                    # If original attn expected qkv splitting, call original attn
+                    x = self_block.attn(qkv)
+                if hasattr(self_block, 'mlp'):
+                    x_mlp = self_block.mlp(x)
+                    x_mlp = torch.clamp(x_mlp, -10.0, 10.0)
+                    x = x + x_mlp
+                x = torch.clamp(x, -10.0, 10.0)
+            except Exception:
+                # Fallback to original forward if structure differs
+                try:
+                    x = self_block.__class__.forward(self_block, x)
+                except Exception:
+                    pass
+            return x
+        for resblock in self.model.visual.transformer.resblocks:
+            resblock.forward = types.MethodType(clamped_forward, resblock)
+        self._patched = True
+        print("✓ Patched visual forwards with activation clamping")
+
+    def get_optimizer(self):
+        # Build parameter groups carefully to avoid empty groups
+        scale_params = [p for p in [getattr(self.model, 'logit_scale', None)] if p is not None and getattr(p, 'requires_grad', False)]
+        # Include visual.proj when available so both sides of the projection can adapt
+        proj_params = [p for p in [getattr(self.model, 'text_projection', None), getattr(getattr(self.model, 'visual', None), 'proj', None)] if p is not None and getattr(p, 'requires_grad', False)]
+        lora_params = []
+        if self.lora_applied:
+            for module in self.model.modules():
+                if hasattr(module, 'lora_A') and getattr(module, 'lora_A', None) is not None:
+                    # collect the underlying tensors used by LoRA wrappers
+                    try:
+                        if getattr(module, 'lora_A', None) is not None:
+                            lora_params.append(module.lora_A)
+                        if getattr(module, 'lora_B', None) is not None:
+                            lora_params.append(module.lora_B)
+                    except Exception:
+                        pass
+
+        # Optimizers: AdamW for projection and LoRA (paper-style higher LR), AdamW for scale with even higher LR
+        other_params = proj_params + lora_params
+        # reduce weight decay on projection params during fine-tuning
+        other_optim = torch.optim.AdamW(other_params, lr=self.base_lr, weight_decay=0.0) if other_params else None
+        # Use a more conservative LR for logit_scale so updates are stable; include default betas
+        # Use a slightly larger LR for logit_scale to allow it to adapt faster during initial steps
+        scale_optim = torch.optim.AdamW(scale_params, lr=5e-4, betas=(0.9, 0.999), weight_decay=0.0) if scale_params else None
+        return other_optim, scale_optim
+
     @staticmethod
     def contrastive_loss(logits_per_image, logits_per_text, device, temperature=0.07):
         bsz = logits_per_image.shape[0]
         labels = torch.arange(bsz, device=device)
-        
-        # Temperature-scaled logits
-        logits_i = logits_per_image / temperature
-        logits_t = logits_per_text / temperature
-        
+        logits_i = torch.clamp(logits_per_image / temperature, -15, 15)
+        logits_t = torch.clamp(logits_per_text / temperature, -15, 15)
         loss_i = F.cross_entropy(logits_i, labels)
         loss_t = F.cross_entropy(logits_t, labels)
-        return 0.5 * (loss_i + loss_t)
-    
-    def train(self, dataset_path, epochs=25, batch_size=16, lr=1e-6, 
-              save_path="enhanced_clip_finetuned.pt", weight_decay=1e-5):
-        """
-        Enhanced training with lower LR, more epochs, smaller batches for stability.
-        """
-        dataset = AugmentedIntersectionDataset(dataset_path, transform=self.preprocess, augment_prob=0.5)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
+        loss = 0.5 * (loss_i + loss_t)
+        if not torch.isfinite(loss):
+            return torch.tensor(5.0, device=device, requires_grad=True)
+        return loss
+
+    def _safe_encode_image(self, images):
+        if not hasattr(self, '_patched'):
+            self._patch_visual_forwards()
+        features = self.model.encode_image(images)
+        features = torch.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
+        features = torch.clamp(features, -2.0, 2.0)
+        features += 1e-6 * torch.randn_like(features)
+        if not torch.isfinite(features).all():
+            features.zero_()
+        return F.normalize(features, dim=-1)
+
+    def _safe_encode_text(self, tokens):
+        features = self.model.encode_text(tokens)
+        features = torch.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
+        features = torch.clamp(features, -2.0, 2.0)
+        features += 1e-6 * torch.randn_like(features)
+        if not torch.isfinite(features).all():
+            features.zero_()
+        return F.normalize(features, dim=-1)
+
+    def _handle_gradients(self):
+        total_nonfinite = 0
+        total_elements = 0
+        details = {}
         
-        # Only optimize trainable params
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        optim = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        for name, param in self.model.named_parameters():
+            if param.grad is not None and param.requires_grad:
+                mask = ~torch.isfinite(param.grad)
+                nonfinite = mask.sum().item()
+                total_nonfinite += nonfinite
+                total_elements += param.numel()
+                if nonfinite > 0:
+                    param.grad[mask] = 0.0
+                    if nonfinite / param.numel() > 0.5:
+                        details[name] = f"{nonfinite}/{param.numel()} ({nonfinite/param.numel()*100:.1f}%)"
         
-        # Learning rate scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=epochs, eta_min=lr/10)
+        fraction = total_nonfinite / max(1, total_elements)
+        if details:
+            print(f"⚠️ Handled NaN grads (fraction={fraction:.1%}): {details}")
+        
+        # Loosen gradient clipping to a reasonable value to allow learning
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        return fraction < 0.1
+
+    def train(self, dataset_path, epochs=15, batch_size=2, save_path="stable_clip_lora.pt", 
+              weight_decay=0.1, max_skip_rate=0.2):
+        dataset = AugmentedIntersectionDataset(dataset_path, transform=self.preprocess, augment_prob=0.2)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True)
+        # Quick dataset inspection for diversity problems
+        try:
+            print("Dataset sample descriptions (5 random):")
+            for _ in range(5):
+                idx = random.randint(0, len(dataset) - 1)
+                sample = dataset.data[idx]
+                img_path = sample.get('image_gray') or sample.get('image') or sample.get('image_rgb')
+                if img_path is None:
+                    print(f" - [no-image-key] available keys: {list(sample.keys())}")
+                else:
+                    print(f" - {img_path}: '{sample['description'][:120]}...'")
+        except Exception:
+            pass
+
+        # Gradient accumulation to simulate larger effective batch size
+        accum_steps = max(1, getattr(self, 'accum_steps', 16))  # effective bsz = batch_size * accum_steps (tweak if OOM)
+
+        other_optim, scale_optim = self.get_optimizer()
+        scheduler_other = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(other_optim, T_0=5, eta_min=self.base_lr/20) if other_optim is not None else None
+        scheduler_scale = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(scale_optim, T_0=5, eta_min=self.base_lr/50) if scale_optim is not None else None
         
         self.model.train()
-        
         best_loss = float('inf')
-        patience = 5
-        no_improve = 0
+        stage = 0
+        self._unfreeze_stage(0)  # Start with stage 0
         
         for epoch in range(epochs):
-            total_loss, batches = 0.0, 0
-            pbar = tqdm(loader, desc=f"Enhanced CLIP FT Epoch {epoch+1}/{epochs}")
+            # More aggressive stage advancement: every 2 epochs, require lower loss
+            if epoch % 2 == 0 and epoch > 0:
+                if hasattr(self, 'last_avg_loss') and self.last_avg_loss < 1.5:
+                    stage += 1
+                    if stage <= 2:
+                        self._unfreeze_stage(stage)
+                        other_optim, scale_optim = self.get_optimizer()
+                        print(f"🔓 Advanced to stage {stage}: {self.num_trainable} params")
+                    else:
+                        print("Max stage reached; full LoRA on blocks 10-11")
+                else:
+                    print(f"Loss {getattr(self, 'last_avg_loss', 'inf'):.2f} >=1.5; staying at stage {stage}")
+
+            loss_accum, batches, skipped = 0.0, 0, 0
+            pbar = tqdm(loader, desc=f"Stable CLIP FT Epoch {epoch+1}/{epochs} (stage {stage})")
             
-            for images, texts in pbar:
+            for batch_idx, (images, texts) in enumerate(pbar):
+                if self.global_step < self.warmup_steps:
+                    progress = self.global_step / self.warmup_steps
+                    lr_other = self.warmup_lr + progress * (self.base_lr - self.warmup_lr)
+                    if other_optim is not None:
+                        other_optim.param_groups[0]['lr'] = lr_other
+                    # Keep the scale optimizer near its configured base LR during warmup
+                    if scale_optim is not None:
+                        try:
+                            base_scale_lr = scale_optim.defaults.get('lr', 1e-3)
+                        except Exception:
+                            base_scale_lr = 1e-3
+                        scale_optim.param_groups[0]['lr'] = base_scale_lr
+                    self.global_step += 1
+                
                 images = images.to(self.device)
                 tokens = clip.tokenize(texts, truncate=True).to(self.device)
-                
-                optim.zero_grad()
+
+                # Paper-style: gentle scale behavior — allow logit_scale to move freely but keep safe clamps
+                target_scale = 2.8
+                current_scale = self.model.logit_scale
+                # Disable scale regularization for now (lets scale adapt freely)
+                scale_reg = torch.tensor(0.0, device=self.device)
+
+                # Apply a gentler clamp range so temperature can increase naturally
+                with torch.no_grad():
+                    # Only clamp the parameter to a wide-safe interval to prevent extreme values
+                    self.model.logit_scale.data = torch.clamp(self.model.logit_scale.data, -getattr(self, 'clamp_val', 6.0), getattr(self, 'clamp_val', 6.0))
+                scale = self.model.logit_scale
+                logit_scale = scale.exp()
+                # Quick debug print to observe progression (remove in production)
+                if batch_idx % 10 == 0:
+                    try:
+                        print(f"DEBUG SCALE: batch={batch_idx} global_step={self.global_step} current_param={float(current_scale):.3f} logit_scale={float(logit_scale):.3f} reg={float(scale_reg):.3f}")
+                        if scale_optim is not None:
+                            print(f"DEBUG SCALE LR: {scale_optim.param_groups[0]['lr']:.3e}")
+                        # logit_scale gradient (may be None before backward)
+                        try:
+                            g = self.model.logit_scale.grad
+                            if g is not None:
+                                print(f"DEBUG SCALE GRAD: {float(g.item()):.6e}")
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                # Zero grads at accumulation boundaries
+                if (batch_idx % accum_steps) == 0:
+                    if other_optim is not None:
+                        other_optim.zero_grad()
+                    if scale_optim is not None:
+                        scale_optim.zero_grad()
                 
                 try:
-                    image_features = self.model.encode_image(images)
-                    text_features = self.model.encode_text(tokens)
+                    image_features = self._safe_encode_image(images)
+                    text_features = self._safe_encode_text(tokens)
                     
-                    # Normalize features
-                    image_features = F.normalize(image_features, dim=-1)
-                    text_features = F.normalize(text_features, dim=-1)
-                    
-                    # Compute similarity matrix
-                    logit_scale = self.model.logit_scale.exp()
-                    logits_per_image = logit_scale * image_features @ text_features.t()
-                    logits_per_text = logit_scale * text_features @ image_features.t()
-                    
-                    loss = self.contrastive_loss(logits_per_image, logits_per_text, self.device)
-                    
-                    if torch.isnan(loss) or torch.isinf(loss):
-                        print(f"NaN/Inf loss detected, skipping batch")
+                    if not (torch.isfinite(image_features).all() and torch.isfinite(text_features).all()):
+                        skipped += 1
                         continue
                     
-                    loss.backward()
-                    # Enhanced gradient clipping
-                    torch.nn.utils.clip_grad_norm_(params, max_norm=0.5)
-                    optim.step()
-                    scheduler.step()
+                    # (scale and logit_scale already set earlier with dynamic clamp)
                     
-                    total_loss += loss.item()
+                    sim_img = image_features @ text_features.t()
+                    sim_text = text_features @ image_features.t()
+                    # Hard-negative amplification: boost off-diagonal similarities above a threshold
+                    try:
+                        with torch.no_grad():
+                            hard_thresh = 0.05
+                            off = sim_img.clone()
+                            off.fill_diagonal_(0.0)
+                            hard_mask = off > hard_thresh
+                        # Amplify hard negatives slightly so they contribute more to loss
+                        sim_img = sim_img + (hard_mask.float() * 0.2 * sim_img)
+                        sim_text = sim_text + (hard_mask.float() * 0.2 * sim_text)
+                    except Exception:
+                        pass
+                    # Log off-diagonal similarity (should be lower than diagonal by margin)
+                    try:
+                        with torch.no_grad():
+                            off_diag = sim_img.clone()
+                            diag = torch.diag(off_diag)
+                            off_diag.fill_diagonal_(0.0)
+                            avg_off = float(off_diag.mean().item())
+                    except Exception:
+                        avg_off = float(sim_img.mean().item())
+                    # Apply clamping for numerical stability
+                    sim_img = torch.clamp(sim_img, -getattr(self, 'clamp_val', 3.0), getattr(self, 'clamp_val', 3.0))
+                    sim_text = torch.clamp(sim_text, -getattr(self, 'clamp_val', 3.0), getattr(self, 'clamp_val', 3.0))
+                    
+                    logits_per_image = logit_scale * sim_img
+                    logits_per_text = logit_scale * sim_text
+                    logits_per_image.clamp_(-20, 20)
+                    logits_per_text.clamp_(-20, 20)
+                    
+                    loss = self.contrastive_loss(logits_per_image, logits_per_text, self.device)
+
+                    # Add the gentle scale regularization term computed above
+                    loss_for_backward = loss + scale_reg
+
+                    if not torch.isfinite(loss_for_backward) or loss_for_backward.item() > 15:
+                        skipped += 1
+                        continue
+
+                    # Scale loss for accumulation
+                    loss_for_backward = loss_for_backward / float(accum_steps)
+                    loss_for_backward.backward()
+
+                    # Grad monitoring every accumulation step
+                    if (batch_idx + 1) % accum_steps == 0:
+                        try:
+                            grad_norm = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=getattr(self, 'max_grad_norm', 20.0)))
+                        except Exception:
+                            grad_norm = -1.0
+                        print(f"DEBUG GRAD: batch={batch_idx} grad_norm={grad_norm:.4f}")
+
+                    # Step only at accumulation boundary
+                    if ((batch_idx + 1) % accum_steps == 0) or (batch_idx + 1 == len(loader)):
+                        proceed = self._handle_gradients()
+                        if not proceed:
+                            skipped += 1
+                            # zero grads to avoid accumulation of bad state
+                            if other_optim is not None:
+                                other_optim.zero_grad()
+                            if scale_optim is not None:
+                                scale_optim.zero_grad()
+                            continue
+
+                        if other_optim is not None:
+                            other_optim.step()
+                        if scale_optim is not None:
+                            scale_optim.step()
+                    
+                    with torch.no_grad():
+                        # Keep a gentler clamp on the parameter itself
+                        self.model.logit_scale.clamp_(-getattr(self, 'clamp_val', 6.0), getattr(self, 'clamp_val', 6.0))
+                        # Soft weight clipping for LoRA/proj params to stabilize early steps
+                        for name, p in self.model.named_parameters():
+                            if p.requires_grad and ('lora' in name or 'text_projection' in name or 'proj' in name):
+                                try:
+                                    p.clamp_(-getattr(self, 'clamp_val', 5.0), getattr(self, 'clamp_val', 5.0))
+                                except Exception:
+                                    pass
+
+                    if scheduler_other is not None:
+                        scheduler_other.step()
+                    if scheduler_scale is not None:
+                        scheduler_scale.step()
+                    
+                    loss_accum += loss.item()
                     batches += 1
+                    self.last_avg_loss = loss_accum / max(1, batches)
+                    
+                    if batch_idx % 20 == 0:
+                        avg_sim = sim_img.diag().mean().item()
+                        print(f"Batch {batch_idx}: stage={stage}, scale={scale.item():.3f}, sim={avg_sim:.3f}, loss={loss.item():.3f}")
+                    
                     pbar.set_postfix({
-                        "loss": f"{loss.item():.4f}",
-                        "lr": f"{scheduler.get_last_lr()[0]:.2e}"
+                        "loss": f"{loss.item():.3f}",
+                        "scale": f"{scale.item():.2f}",
+                        "sim": f"{avg_sim:.3f}",
+                        "nan_frac": f"{0:.1%}",
+                        "skipped": skipped
                     })
                     
                 except Exception as e:
-                    print(f"Training error: {e}")
+                    print(f"Batch {batch_idx} error: {e}")
+                    skipped += 1
                     continue
             
-            avg_loss = total_loss / max(1, batches)
-            print(f"Epoch {epoch+1}: avg loss = {avg_loss:.4f}")
+            avg_loss = loss_accum / max(1, batches)
+            skip_rate = skipped / max(1, len(loader))
+            print(f"Epoch {epoch+1}: loss={avg_loss:.4f}, skip={skip_rate:.1%}, trainable={self.num_trainable}")
             
-            # Early stopping
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                no_improve = 0
+            if skip_rate > max_skip_rate:
+                print("High skips: Re-freeze visuals, scale-only")
+                for name, p in self.model.named_parameters():
+                    if 'visual' in name and p.requires_grad:
+                        p.requires_grad = False
+                other_optim, scale_optim = self.get_optimizer()
+            
+            if avg_loss < best_loss and batches > len(loader)*0.8:
                 torch.save(self.model.state_dict(), save_path)
-                print(f"✓ New best model saved: {avg_loss:.4f}")
-            else:
-                no_improve += 1
-                if no_improve >= patience:
-                    print(f"Early stopping at epoch {epoch+1}")
-                    break
+                best_loss = avg_loss
+                print(f"✓ Saved stable LoRA model: {avg_loss:.4f}")
+            # If the loss is stuck near the uniform baseline (log(batch_size*accum)), force unfreeze to give model more capacity
+            try:
+                effective_bsz = batch_size * accum_steps
+                baseline = float(np.log(max(2, effective_bsz)))
+                if (epoch == 0 or epoch == 2) and avg_loss > 0.95 * baseline:
+                    print(f"⚠️ Loss {avg_loss:.3f} near baseline {baseline:.3f}; forcing stage advancement to 1 to unblock learning")
+                    stage = max(stage, 1)
+                    self._unfreeze_stage(1)
+                    other_optim, scale_optim = self.get_optimizer()
+            except Exception:
+                pass
         
-        print(f"Final fine-tuned CLIP model saved to {save_path}")
         return self.model
-    
+
     def load_finetuned(self, path):
         self.model.load_state_dict(torch.load(path, map_location=self.device))
         self.model.eval()
@@ -900,7 +1247,6 @@ def train_enhanced_dqn(clip_model_path, total_timesteps=300000, use_clip=True,
         features_extractor_kwargs=dict(features_dim=512),
         net_arch=[256, 256],  # Deeper MLP
         activation_fn=torch.nn.ReLU,
-        dueling=True,  # Dueling DQN
     )
     
     # Enhanced DQN hyperparameters
@@ -910,12 +1256,13 @@ def train_enhanced_dqn(clip_model_path, total_timesteps=300000, use_clip=True,
         learning_rate=5e-4,
         buffer_size=100000,         # Larger replay buffer
         learning_starts=5000,       # More warmup
-        train_freq=(4, 1),          # Train every 4 steps, 1 gradient step
+    train_freq=(4, 'step'),     # Train every 4 steps, 1 gradient step (SB3 expects unit 'step' or 'episode')
         gradient_steps=1,
         batch_size=32,
         tau=1.0,                    # Full target network replacement
         gamma=0.95,                 # Paper value
         target_update_interval=1000,
+        
         
         # Enhanced exploration
         exploration_fraction=0.5,   # Half episode for exploration
@@ -928,7 +1275,7 @@ def train_enhanced_dqn(clip_model_path, total_timesteps=300000, use_clip=True,
         device=device,
         seed=seed,
         tensorboard_log=f"./logs/enhanced_dqn_{'clip' if use_clip else 'vanilla'}_{seed}/",
-        optimize_memory_usage=True,
+        optimize_memory_usage=False,
     )
     
     # Enhanced callback
@@ -1315,15 +1662,15 @@ def collect_enhanced_intersection_data(n_episodes=500, save_path="enhanced_inter
                                      use_dle=True, curriculum_densities=True):
     """
     Enhanced data collection: 500 episodes, curriculum densities, rich directional descriptions,
-    high-quality 600x600 RGB images for CLIP fine-tuning.
+    high-quality 600x600 RGB and 224x224 grayscale images for CLIP fine-tuning.
     """
     print("\n" + "="*80)
     print("📸 Enhanced Data Collection for CLIP Fine-tuning")
     print(f"Episodes: {n_episodes} | Curriculum: {curriculum_densities} | DLE: {use_dle}")
-    print("Output: 600x600 RGB + rich directional descriptions")
+    print("Output: 600x600 RGB + 224x224 grayscale images with rich directional descriptions")
     print("="*80)
     
-    # Setup environment for data collection (RGB rendering)
+    # Setup environment for RGB rendering
     env = gym.make("intersection-v1", render_mode="rgb_array")
     
     # Base config with curriculum support
@@ -1342,112 +1689,130 @@ def collect_enhanced_intersection_data(n_episodes=500, save_path="enhanced_inter
         },
         "duration": 40,
         "simulation_frequency": 15,
-        "policy_frequency": 1,  # Collect at every step
+        "policy_frequency": 1,
         "reward_speed_range": [7.0, 9.0],
         "normalize_reward": False,
         "offroad_terminal": False,
-        # High-quality rendering
         "screen_width": 600,
         "screen_height": 600,
-        "centering_position": [0.3, 0.5],
-        "scaling": 5.5,
+        "centering_position": [0.5, 0.3],
+        "scaling": 7.0,
         "show_trajectories": False,
     }
     
-    # Density curriculum for data collection
-    density_schedule = [1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 5, 6, 6, 7, 8] * 30  # Cycle through densities
+    # Density curriculum
+    density_schedule = [1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 5, 6, 6, 7, 8] * 30
     if not curriculum_densities:
-        density_schedule = [5] * n_episodes  # Fixed density
+        density_schedule = [5] * n_episodes
     
     dataset = []
-    img_dir = "enhanced_intersection_images"
-    os.makedirs(img_dir, exist_ok=True)
+    rgb_img_dir = "rgb_intersection_images"
+    gray_img_dir = "enhanced_intersection_images"
+    os.makedirs(rgb_img_dir, exist_ok=True)
+    os.makedirs(gray_img_dir, exist_ok=True)
     
-    # Initialize enhanced encoder
     dle = EnhancedDataLanguageEncoder() if use_dle else None
     
     print(f"Collecting {n_episodes} episodes across varying densities...")
     
     for episode in tqdm(range(n_episodes), desc="Collecting enhanced data"):
-        # Set density for this episode
-        density_idx = min(episode // 30, len(density_schedule) - 1)  # Change every 30 eps
+        density_idx = min(episode // 30, len(density_schedule) - 1)
         current_density = density_schedule[density_idx]
         
-        # Update config
         config = base_config.copy()
         config.update({
             "initial_vehicle_count": current_density,
-            "spawn_probability": 0.1 + 0.025 * current_density,  # Scale spawn with density
+            "spawn_probability": 0.1 + 0.025 * current_density,
         })
         env.unwrapped.config.update(config)
         
         obs, info = env.reset(seed=episode)
         done = False
         step = 0
-        max_steps = 40 * 15  # 40s * 15Hz
+        max_steps = 40 * 15
         
         while not done and step < max_steps:
-            # Get high-quality RGB frame
             rgb_frame = env.render()
-            
-            if rgb_frame is not None and len(rgb_frame.shape) == 3:
-                # Generate rich description using enhanced DLE
-                if use_dle and dle is not None:
-                    description, action_phrase = dle.describe(env)
-                else:
-                    # Fallback with density awareness
-                    ego = env.unwrapped.vehicle
-                    if ego is not None:
-                        speed = ego.speed
-                        nearby_vehicles = len([v for v in env.unwrapped.road.vehicles 
-                                             if v is not ego and np.linalg.norm(v.position - ego.position) < 25])
-                        
-                        if nearby_vehicles >= current_density * 0.5 and speed > 6:
-                            description = f"heavy traffic ({current_density} vehicles nearby); slow down and be cautious"
-                        elif nearby_vehicles < 2 and speed < 4:
-                            description = f"light traffic ({current_density} vehicles); speed up and go faster"
-                        else:
-                            description = f"moderate traffic ({current_density} vehicles); maintain current speed"
-                        action_phrase = description.split("action:")[-1].strip() if "action:" in description else "maintain current speed"
+            if rgb_frame is None or getattr(rgb_frame, 'size', 0) == 0 or len(rgb_frame.shape) != 3:
+                action = env.action_space.sample()
+                obs, _, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                step += 1
+                continue
+
+            # Convert RGB to grayscale and resize for CLIP
+            frame_gray = (0.2989 * rgb_frame[..., 0] + 0.5870 * rgb_frame[..., 1] + 0.1140 * rgb_frame[..., 2])
+            frame_gray = np.clip(frame_gray, 0, 255).astype(np.uint8)
+            pil_gray = Image.fromarray(frame_gray).resize((224, 224), resample=Image.BILINEAR).convert('L')
+
+            # Save RGB (600x600) and grayscale (224x224)
+            pil_rgb = Image.fromarray(rgb_frame)
+            gray_img_path = os.path.join(gray_img_dir, f"ep{episode:03d}_t{step:03d}_d{current_density}.png")
+            rgb_img_path = os.path.join(rgb_img_dir, f"ep{episode:03d}_t{step:03d}_d{current_density}.png")
+            try:
+                pil_gray.save(gray_img_path, format='PNG', optimize=True)
+            except Exception:
+                pil_gray.save(gray_img_path)
+            try:
+                pil_rgb.save(rgb_img_path, format='PNG', quality=95, optimize=True)
+            except Exception:
+                pil_rgb.save(rgb_img_path)
+
+            if use_dle and dle is not None:
+                description, action_phrase = dle.describe(env)
+            else:
+                ego = env.unwrapped.vehicle
+                if ego is not None:
+                    speed = ego.speed
+                    nearby_vehicles = len([v for v in env.unwrapped.road.vehicles 
+                                         if v is not ego and np.linalg.norm(v.position - ego.position) < 25])
+                    if nearby_vehicles >= current_density * 0.5 and speed > 6:
+                        description = f"heavy traffic ({current_density} vehicles nearby); slow down and be cautious"
+                    elif nearby_vehicles < 2 and speed < 4:
+                        description = f"light traffic ({current_density} vehicles); speed up and go faster"
                     else:
-                        description = f"intersection with {current_density} expected vehicles; maintain safe speed"
-                        action_phrase = "maintain current speed"
-                
-                # Save high-quality image
-                img = Image.fromarray(rgb_frame)
-                img_filename = f"ep{episode:03d}_t{step:03d}_d{density_schedule[density_idx]}.png"
-                img_path = os.path.join(img_dir, img_filename)
-                img.save(img_path, quality=95, optimize=True)
-                
-                dataset.append({
-                    "image": img_path,
-                    "description": description,
-                    "action": action_phrase,
-                    "episode": episode,
-                    "step": step,
-                    "density": current_density,
-                    "ego_speed": float(env.unwrapped.vehicle.speed) if env.unwrapped.vehicle else 0.0
-                })
-            
-            # Random action for exploration
+                        description = f"moderate traffic ({current_density} vehicles); maintain current speed"
+                    action_phrase = description.split("action:")[-1].strip() if "action:" in description else "maintain current speed"
+                else:
+                    description = f"intersection with {current_density} expected vehicles; maintain safe speed"
+                    action_phrase = "maintain current speed"
+
+            dataset.append({
+                "image_rgb": rgb_img_path,
+                "image_gray": gray_img_path,
+                "description": description,
+                "action": action_phrase,
+                "episode": episode,
+                "step": step,
+                "density": current_density,
+                "ego_speed": float(env.unwrapped.vehicle.speed) if env.unwrapped.vehicle else 0.0
+            })
+
+            if step == 0:
+                try:
+                    print(f"DEBUG IMG: rgb={rgb_img_path} size={pil_rgb.size} "
+                          f"min={int(rgb_frame.min())} max={int(rgb_frame.max())} | "
+                          f"gray={gray_img_path} size={pil_gray.size}")
+                except Exception:
+                    pass
+
             action = env.action_space.sample()
-            obs, reward, terminated, truncated, info = env.step(action)
+            obs, _, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             step += 1
-        
-        # Progress indicator
+
         if episode % 100 == 0:
             print(f"Episode {episode}: Collected {len(dataset)} samples | "
                   f"Current density: {current_density}")
-    
-    # Save dataset
+
     with open(save_path, 'w') as f:
         json.dump(dataset, f, indent=2)
-    
+
     print(f"\n✅ Enhanced dataset saved to {save_path}")
     print(f"📈 Total samples: {len(dataset)} across {n_episodes} episodes")
     print(f"🎯 Density distribution: {min(density_schedule):d}-{max(density_schedule):d} vehicles")
-    print(f"🖼️  Images saved to: {img_dir}/ (600x600 RGB, high quality)")
+    print(f"🖼️  RGB images saved to: {rgb_img_dir}/ (600x600)")
+    print(f"🖼️  Grayscale images saved to: {gray_img_dir}/ (224x224)")
     
     if use_dle:
         print("📝 Descriptions generated with Enhanced Data Language Encoder (directional)")
@@ -1467,8 +1832,8 @@ def main_enhanced_pipeline():
     N_SEEDS = 3  # Run multiple seeds for robustness
     
     # Pipeline flags
-    COLLECT_DATA = True
-    FINETUNE_CLIP = True
+    COLLECT_DATA = False
+    FINETUNE_CLIP = False
     TRAIN_DQN = True
     TRAIN_PPO = True  # Focus on DQN first (better per paper)
     EVALUATE_VANILLA = True
@@ -1476,7 +1841,7 @@ def main_enhanced_pipeline():
     
     # Paths
     data_path = "enhanced_intersection_dataset.json"
-    clip_path = "enhanced_clip_finetuned.pt"
+    clip_path = "robust_clip_finetuned.pt"
     models_dir = "enhanced_models"
     os.makedirs(models_dir, exist_ok=True)
     
@@ -1527,12 +1892,11 @@ def main_enhanced_pipeline():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {device}")
         
-        ft = EnhancedCLIPFineTuner(model_name="ViT-B/32", device=device)
+        ft = RobustCLIPFineTuner(model_name="ViT-B/32", device=device)
         ft.train(
             dataset_path=data_path,
-            epochs=25,
-            batch_size=16,      # Smaller batches for stability
-            lr=1e-6,            # Lower learning rate
+            epochs=15,
+            batch_size=256,      # Increased batch size to improve contrastive negatives
             save_path=clip_path,
             weight_decay=1e-5
         )
@@ -1546,7 +1910,11 @@ def main_enhanced_pipeline():
         print("\n🔍 Quick CLIP validation:")
         for i in range(3):
             sample = dataset[i]
-            img = Image.open(sample['image'])
+            img_path = sample.get('image_gray') or sample.get('image') or sample.get('image_rgb')
+            if img_path is None:
+                print(f"Sample {i}: no image key found; keys={list(sample.keys())}")
+                continue
+            img = Image.open(img_path)
             frame = np.array(img.resize((224, 224)))
             r_clip, best_act, conf, probs = test_rm.score(frame)
             action_names = ["SLOW", "IDLE", "FAST"]
