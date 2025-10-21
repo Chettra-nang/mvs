@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama-llm
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_NO_TELEMETRY=1
+    # Use entrypoint override so the shell is executed in the container (the image's
+    # default ENTRYPOINT is the `ollama` binary; passing a shell as `command` made the
+    # binary receive the shell name as an argument). Overriding entrypoint ensures
+    # we run the shell which then launches `ollama serve` and the model pull.
+    entrypoint: ["/bin/sh","-lc","echo 'Starting Ollama server...'; ollama serve & sleep 8; echo 'Attempting to pull llama3.1:8b (idemp.)'; ollama pull llama3.1:8b || echo 'Pull failed or model exists'; wait"]
+
+  collector:
+    build:
+      # build context should be the repository root (two levels up from this folder)
+      context: ../..
+      # dockerfile path is relative to the build context
+      dockerfile: ./test2/ollama-setup/Dockerfile
+    container_name: mvs-collector
+    restart: "no"
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_API_URL=http://ollama:11434
+      # Point to mounted host venv inside container
+      - VIRTUAL_ENV=/opt/venv
+      - PATH=/opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    volumes:
+      # mount the repository root into the container so /workspace is the repo
+      - ../..:/workspace:rw
+      # mount host virtualenv (read-only) to reuse your environment
+      - /home/chettra/ITC/mvs-manus/mvs_venv:/opt/venv:ro
+    working_dir: /workspace/test2
+    # Try using host venv if available; otherwise fall back to container python3.
+    # This prevents startup errors when the mounted venv path doesn't contain
+    # a usable Python binary inside the container.
+    entrypoint: ["/bin/sh","-c","if [ -x /opt/venv/bin/python ]; then \n  echo 'Using host venv Python at /opt/venv/bin/python'; \n  exec /opt/venv/bin/python /workspace/test2/clip-rl-2.py collect --episodes 10 --output_dir /workspace/test2/collected; \nelse \n  echo 'Host venv not available or incompatible; falling back to container python3 (shows help)'; \n  exec python3 /workspace/test2/clip-rl-2.py --help; \nfi"]
+
+volumes:
+  ollama_data:

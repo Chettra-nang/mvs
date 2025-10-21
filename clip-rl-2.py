@@ -48,8 +48,16 @@ except Exception:
     LoraConfig = None
     def get_peft_model(*args, **kwargs):
         raise RuntimeError("PEFT not available")
+# Optional Ollama client for LLM-generated descriptions
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except Exception:
+    OLLAMA_AVAILABLE = False
 import types
 import json
+import argparse
+from pathlib import Path
 import warnings
 from collections import deque
 import random
@@ -231,23 +239,13 @@ class AugmentedIntersectionDataset(Dataset):
         self.augment_prob = augment_prob
         with open(data_path, 'r') as f:
             self.data = json.load(f)
-        # simple synonym map to boost textual variation (low-risk augmentation)
-        self._synonyms = {
-            'slow down': ['decelerate', 'brake cautiously', 'reduce speed'],
-            'maintain current speed': ['hold speed', 'keep current speed'],
-            'speed up': ['accelerate', 'increase speed', 'go faster']
-        }
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
         item = self.data[idx]
-        # Prefer grayscale image saved for CLIP (paper); fall back to legacy keys
-        img_path = item.get('image_gray') or item.get('image') or item.get('image_rgb')
-        if img_path is None:
-            raise KeyError(f"No image path found in dataset item: keys={list(item.keys())}")
-        image = Image.open(img_path).convert('RGB')
+        image = Image.open(item['image']).convert('RGB')
         
         # Augmentation
         if random.random() < self.augment_prob:
@@ -263,12 +261,6 @@ class AugmentedIntersectionDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         text = item['description']
-        # Simple text augmentation: replace common phrases with synonyms at random
-        if random.random() < 0.25:
-            for k, v in self._synonyms.items():
-                if k in text:
-                    text = text.replace(k, random.choice(v))
-                    break
         return image, text
 
 class RobustCLIPFineTuner:
@@ -284,25 +276,19 @@ class RobustCLIPFineTuner:
         for p in self.model.parameters():
             p.requires_grad = False
         with torch.no_grad():
-            # Initialize to a CLIP-like temperature (1/0.07 ~= 14.28 -> log ~2.66)
-            self.model.logit_scale.data = torch.tensor(2.66, device=self.device)
-            print(f"🔧 Init logit_scale set to 2.66 (temp~0.07); all frozen initially")
+            self.model.logit_scale.data = torch.tensor(-4.60517, device=self.device)
+            print(f"🔧 Ultra-stable init: scale=-4.605, all frozen")
         
         self.num_trainable = 0
         self.global_step = 0
-        # Paper-style defaults: higher LR for projection/LoRA, slightly larger warmup
-        self.warmup_steps = 200
+        # Paper-style defaults: higher LR for projection/LoRA, minimal warmup
+        self.warmup_steps = 0
         # base_lr targets projection/LoRA params only (visual backbone remains frozen)
         self.base_lr = 5e-4
         self.warmup_lr = 0.0
         self.unfrozen_blocks = []  # Track unfrozen visual blocks
         self.lora_applied = False
         self.action_descriptions = ["slow down and be cautious", "maintain current speed", "speed up and go faster"]
-        # Training hyperparams we may tune dynamically
-        self.accum_steps = 32  # increase effective batch negatives (watch memory)
-        self.max_grad_norm = 20.0
-        self.clamp_val = 10.0
-        self.scale_regularization_start = 1000  # don't regularize scale until enough steps
 
     # NEW: Apply LoRA to specific visual blocks (low-rank to prevent NaNs)
     def _apply_lora_to_blocks(self, block_indices=[10, 11]):
@@ -342,15 +328,9 @@ class RobustCLIPFineTuner:
                     self.model.logit_scale.requires_grad_(True)
                 if hasattr(self.model, 'text_projection'):
                     self.model.text_projection.requires_grad_(True)
-                # Also allow small adaptation of the visual projection to help alignment
-                if hasattr(self.model, 'visual') and hasattr(self.model.visual, 'proj'):
-                    try:
-                        self.model.visual.proj.requires_grad_(True)
-                    except Exception:
-                        pass
             except Exception:
                 pass
-            print("✓ Unfroze scale + text_projection + visual.proj (if available)")
+            print("✓ Unfroze scale + text_projection (~262k params)")
         elif stage == 1:
             self._apply_lora_to_blocks([11])
             self.unfrozen_blocks = [11]
@@ -395,8 +375,7 @@ class RobustCLIPFineTuner:
     def get_optimizer(self):
         # Build parameter groups carefully to avoid empty groups
         scale_params = [p for p in [getattr(self.model, 'logit_scale', None)] if p is not None and getattr(p, 'requires_grad', False)]
-        # Include visual.proj when available so both sides of the projection can adapt
-        proj_params = [p for p in [getattr(self.model, 'text_projection', None), getattr(getattr(self.model, 'visual', None), 'proj', None)] if p is not None and getattr(p, 'requires_grad', False)]
+        proj_params = [p for p in [getattr(self.model, 'text_projection', None)] if p is not None and getattr(p, 'requires_grad', False)]
         lora_params = []
         if self.lora_applied:
             for module in self.model.modules():
@@ -410,13 +389,10 @@ class RobustCLIPFineTuner:
                     except Exception:
                         pass
 
-        # Optimizers: AdamW for projection and LoRA (paper-style higher LR), AdamW for scale with even higher LR
+        # Optimizers: AdamW for projection and LoRA (paper-style higher LR), SGD for scale with tiny LR
         other_params = proj_params + lora_params
-        # reduce weight decay on projection params during fine-tuning
-        other_optim = torch.optim.AdamW(other_params, lr=self.base_lr, weight_decay=0.0) if other_params else None
-        # Use a more conservative LR for logit_scale so updates are stable; include default betas
-        # Use a slightly larger LR for logit_scale to allow it to adapt faster during initial steps
-        scale_optim = torch.optim.AdamW(scale_params, lr=5e-4, betas=(0.9, 0.999), weight_decay=0.0) if scale_params else None
+        other_optim = torch.optim.AdamW(other_params, lr=self.base_lr, weight_decay=0.01) if other_params else None
+        scale_optim = torch.optim.SGD(scale_params, lr=max(1e-6, self.base_lr * 0.001)) if scale_params else None
         return other_optim, scale_optim
 
     @staticmethod
@@ -472,31 +448,14 @@ class RobustCLIPFineTuner:
         if details:
             print(f"⚠️ Handled NaN grads (fraction={fraction:.1%}): {details}")
         
-        # Loosen gradient clipping to a reasonable value to allow learning
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.01)
         return fraction < 0.1
 
     def train(self, dataset_path, epochs=15, batch_size=2, save_path="stable_clip_lora.pt", 
               weight_decay=0.1, max_skip_rate=0.2):
         dataset = AugmentedIntersectionDataset(dataset_path, transform=self.preprocess, augment_prob=0.2)
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True)
-        # Quick dataset inspection for diversity problems
-        try:
-            print("Dataset sample descriptions (5 random):")
-            for _ in range(5):
-                idx = random.randint(0, len(dataset) - 1)
-                sample = dataset.data[idx]
-                img_path = sample.get('image_gray') or sample.get('image') or sample.get('image_rgb')
-                if img_path is None:
-                    print(f" - [no-image-key] available keys: {list(sample.keys())}")
-                else:
-                    print(f" - {img_path}: '{sample['description'][:120]}...'")
-        except Exception:
-            pass
-
-        # Gradient accumulation to simulate larger effective batch size
-        accum_steps = max(1, getattr(self, 'accum_steps', 16))  # effective bsz = batch_size * accum_steps (tweak if OOM)
-
+        
         other_optim, scale_optim = self.get_optimizer()
         scheduler_other = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(other_optim, T_0=5, eta_min=self.base_lr/20) if other_optim is not None else None
         scheduler_scale = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(scale_optim, T_0=5, eta_min=self.base_lr/50) if scale_optim is not None else None
@@ -529,13 +488,8 @@ class RobustCLIPFineTuner:
                     lr_other = self.warmup_lr + progress * (self.base_lr - self.warmup_lr)
                     if other_optim is not None:
                         other_optim.param_groups[0]['lr'] = lr_other
-                    # Keep the scale optimizer near its configured base LR during warmup
                     if scale_optim is not None:
-                        try:
-                            base_scale_lr = scale_optim.defaults.get('lr', 1e-3)
-                        except Exception:
-                            base_scale_lr = 1e-3
-                        scale_optim.param_groups[0]['lr'] = base_scale_lr
+                        scale_optim.param_groups[0]['lr'] = lr_other * 0.005
                     self.global_step += 1
                 
                 images = images.to(self.device)
@@ -544,37 +498,29 @@ class RobustCLIPFineTuner:
                 # Paper-style: gentle scale behavior — allow logit_scale to move freely but keep safe clamps
                 target_scale = 2.8
                 current_scale = self.model.logit_scale
-                # Disable scale regularization for now (lets scale adapt freely)
-                scale_reg = torch.tensor(0.0, device=self.device)
+                # Minimal regularization: small coefficient to nudge toward target after warmup
+                if self.global_step > max(50, self.warmup_steps):
+                    scale_reg = 0.01 * (current_scale - target_scale) ** 2
+                else:
+                    scale_reg = torch.tensor(0.0, device=self.device)
 
                 # Apply a gentler clamp range so temperature can increase naturally
                 with torch.no_grad():
                     # Only clamp the parameter to a wide-safe interval to prevent extreme values
-                    self.model.logit_scale.data = torch.clamp(self.model.logit_scale.data, -getattr(self, 'clamp_val', 6.0), getattr(self, 'clamp_val', 6.0))
+                    self.model.logit_scale.data = torch.clamp(self.model.logit_scale.data, -6.0, 6.0)
                 scale = self.model.logit_scale
                 logit_scale = scale.exp()
                 # Quick debug print to observe progression (remove in production)
                 if batch_idx % 10 == 0:
                     try:
                         print(f"DEBUG SCALE: batch={batch_idx} global_step={self.global_step} current_param={float(current_scale):.3f} logit_scale={float(logit_scale):.3f} reg={float(scale_reg):.3f}")
-                        if scale_optim is not None:
-                            print(f"DEBUG SCALE LR: {scale_optim.param_groups[0]['lr']:.3e}")
-                        # logit_scale gradient (may be None before backward)
-                        try:
-                            g = self.model.logit_scale.grad
-                            if g is not None:
-                                print(f"DEBUG SCALE GRAD: {float(g.item()):.6e}")
-                        except Exception:
-                            pass
                     except Exception:
                         pass
 
-                # Zero grads at accumulation boundaries
-                if (batch_idx % accum_steps) == 0:
-                    if other_optim is not None:
-                        other_optim.zero_grad()
-                    if scale_optim is not None:
-                        scale_optim.zero_grad()
+                if other_optim is not None:
+                    other_optim.zero_grad()
+                if scale_optim is not None:
+                    scale_optim.zero_grad()
                 
                 try:
                     image_features = self._safe_encode_image(images)
@@ -586,32 +532,8 @@ class RobustCLIPFineTuner:
                     
                     # (scale and logit_scale already set earlier with dynamic clamp)
                     
-                    sim_img = image_features @ text_features.t()
-                    sim_text = text_features @ image_features.t()
-                    # Hard-negative amplification: boost off-diagonal similarities above a threshold
-                    try:
-                        with torch.no_grad():
-                            hard_thresh = 0.05
-                            off = sim_img.clone()
-                            off.fill_diagonal_(0.0)
-                            hard_mask = off > hard_thresh
-                        # Amplify hard negatives slightly so they contribute more to loss
-                        sim_img = sim_img + (hard_mask.float() * 0.2 * sim_img)
-                        sim_text = sim_text + (hard_mask.float() * 0.2 * sim_text)
-                    except Exception:
-                        pass
-                    # Log off-diagonal similarity (should be lower than diagonal by margin)
-                    try:
-                        with torch.no_grad():
-                            off_diag = sim_img.clone()
-                            diag = torch.diag(off_diag)
-                            off_diag.fill_diagonal_(0.0)
-                            avg_off = float(off_diag.mean().item())
-                    except Exception:
-                        avg_off = float(sim_img.mean().item())
-                    # Apply clamping for numerical stability
-                    sim_img = torch.clamp(sim_img, -getattr(self, 'clamp_val', 3.0), getattr(self, 'clamp_val', 3.0))
-                    sim_text = torch.clamp(sim_text, -getattr(self, 'clamp_val', 3.0), getattr(self, 'clamp_val', 3.0))
+                    sim_img = torch.clamp(image_features @ text_features.t(), -3.0, 3.0)
+                    sim_text = torch.clamp(text_features @ image_features.t(), -3.0, 3.0)
                     
                     logits_per_image = logit_scale * sim_img
                     logits_per_text = logit_scale * sim_text
@@ -627,45 +549,25 @@ class RobustCLIPFineTuner:
                         skipped += 1
                         continue
 
-                    # Scale loss for accumulation
-                    loss_for_backward = loss_for_backward / float(accum_steps)
                     loss_for_backward.backward()
-
-                    # Grad monitoring every accumulation step
-                    if (batch_idx + 1) % accum_steps == 0:
-                        try:
-                            grad_norm = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=getattr(self, 'max_grad_norm', 20.0)))
-                        except Exception:
-                            grad_norm = -1.0
-                        print(f"DEBUG GRAD: batch={batch_idx} grad_norm={grad_norm:.4f}")
-
-                    # Step only at accumulation boundary
-                    if ((batch_idx + 1) % accum_steps == 0) or (batch_idx + 1 == len(loader)):
-                        proceed = self._handle_gradients()
-                        if not proceed:
-                            skipped += 1
-                            # zero grads to avoid accumulation of bad state
-                            if other_optim is not None:
-                                other_optim.zero_grad()
-                            if scale_optim is not None:
-                                scale_optim.zero_grad()
-                            continue
-
-                        if other_optim is not None:
-                            other_optim.step()
-                        if scale_optim is not None:
-                            scale_optim.step()
+                    
+                    proceed = self._handle_gradients()
+                    if not proceed:
+                        skipped += 1
+                        continue
+                    
+                    if other_optim is not None:
+                        other_optim.step()
+                    if scale_optim is not None:
+                        scale_optim.step()
                     
                     with torch.no_grad():
                         # Keep a gentler clamp on the parameter itself
-                        self.model.logit_scale.clamp_(-getattr(self, 'clamp_val', 6.0), getattr(self, 'clamp_val', 6.0))
+                        self.model.logit_scale.clamp_(-6.0, 6.0)
                         # Soft weight clipping for LoRA/proj params to stabilize early steps
                         for name, p in self.model.named_parameters():
-                            if p.requires_grad and ('lora' in name or 'text_projection' in name or 'proj' in name):
-                                try:
-                                    p.clamp_(-getattr(self, 'clamp_val', 5.0), getattr(self, 'clamp_val', 5.0))
-                                except Exception:
-                                    pass
+                            if p.requires_grad and ('lora' in name or 'text_projection' in name):
+                                p.clamp_(-1.0, 1.0)
 
                     if scheduler_other is not None:
                         scheduler_other.step()
@@ -708,17 +610,6 @@ class RobustCLIPFineTuner:
                 torch.save(self.model.state_dict(), save_path)
                 best_loss = avg_loss
                 print(f"✓ Saved stable LoRA model: {avg_loss:.4f}")
-            # If the loss is stuck near the uniform baseline (log(batch_size*accum)), force unfreeze to give model more capacity
-            try:
-                effective_bsz = batch_size * accum_steps
-                baseline = float(np.log(max(2, effective_bsz)))
-                if (epoch == 0 or epoch == 2) and avg_loss > 0.95 * baseline:
-                    print(f"⚠️ Loss {avg_loss:.3f} near baseline {baseline:.3f}; forcing stage advancement to 1 to unblock learning")
-                    stage = max(stage, 1)
-                    self._unfreeze_stage(1)
-                    other_optim, scale_optim = self.get_optimizer()
-            except Exception:
-                pass
         
         return self.model
 
@@ -1247,6 +1138,7 @@ def train_enhanced_dqn(clip_model_path, total_timesteps=300000, use_clip=True,
         features_extractor_kwargs=dict(features_dim=512),
         net_arch=[256, 256],  # Deeper MLP
         activation_fn=torch.nn.ReLU,
+        dueling=True,  # Dueling DQN
     )
     
     # Enhanced DQN hyperparameters
@@ -1256,13 +1148,12 @@ def train_enhanced_dqn(clip_model_path, total_timesteps=300000, use_clip=True,
         learning_rate=5e-4,
         buffer_size=100000,         # Larger replay buffer
         learning_starts=5000,       # More warmup
-    train_freq=(4, 'step'),     # Train every 4 steps, 1 gradient step (SB3 expects unit 'step' or 'episode')
+        train_freq=(4, 1),          # Train every 4 steps, 1 gradient step
         gradient_steps=1,
         batch_size=32,
         tau=1.0,                    # Full target network replacement
         gamma=0.95,                 # Paper value
         target_update_interval=1000,
-        
         
         # Enhanced exploration
         exploration_fraction=0.5,   # Half episode for exploration
@@ -1659,18 +1550,18 @@ def evaluate_enhanced_agent(model, n_episodes=100, densities=[1, 3, 6], render=F
 # ============================================================================
 
 def collect_enhanced_intersection_data(n_episodes=500, save_path="enhanced_intersection_dataset.json", 
-                                     use_dle=True, curriculum_densities=True):
+                                     use_dle=True, curriculum_densities=True, use_ollama=False):
     """
     Enhanced data collection: 500 episodes, curriculum densities, rich directional descriptions,
-    high-quality 600x600 RGB and 224x224 grayscale images for CLIP fine-tuning.
+    high-quality 600x600 RGB images for CLIP fine-tuning.
     """
     print("\n" + "="*80)
     print("📸 Enhanced Data Collection for CLIP Fine-tuning")
     print(f"Episodes: {n_episodes} | Curriculum: {curriculum_densities} | DLE: {use_dle}")
-    print("Output: 600x600 RGB + 224x224 grayscale images with rich directional descriptions")
+    print("Output: 600x600 RGB + rich directional descriptions")
     print("="*80)
     
-    # Setup environment for RGB rendering
+    # Setup environment for data collection (RGB rendering)
     env = gym.make("intersection-v1", render_mode="rgb_array")
     
     # Base config with curriculum support
@@ -1689,136 +1580,194 @@ def collect_enhanced_intersection_data(n_episodes=500, save_path="enhanced_inter
         },
         "duration": 40,
         "simulation_frequency": 15,
-        "policy_frequency": 1,
+        "policy_frequency": 1,  # Collect at every step
         "reward_speed_range": [7.0, 9.0],
         "normalize_reward": False,
         "offroad_terminal": False,
+        # High-quality rendering
         "screen_width": 600,
         "screen_height": 600,
-        "centering_position": [0.5, 0.3],
-        "scaling": 7.0,
+        "centering_position": [0.3, 0.5],
+        "scaling": 5.5,
         "show_trajectories": False,
     }
     
-    # Density curriculum
-    density_schedule = [1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 5, 6, 6, 7, 8] * 30
+    # Density curriculum for data collection
+    density_schedule = [1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 5, 5, 5, 6, 6, 7, 8] * 30  # Cycle through densities
     if not curriculum_densities:
-        density_schedule = [5] * n_episodes
+        density_schedule = [5] * n_episodes  # Fixed density
     
     dataset = []
-    rgb_img_dir = "rgb_intersection_images"
-    gray_img_dir = "enhanced_intersection_images"
-    os.makedirs(rgb_img_dir, exist_ok=True)
-    os.makedirs(gray_img_dir, exist_ok=True)
+    img_dir = "enhanced_intersection_images"
+    os.makedirs(img_dir, exist_ok=True)
     
+    # Initialize enhanced encoder
     dle = EnhancedDataLanguageEncoder() if use_dle else None
     
     print(f"Collecting {n_episodes} episodes across varying densities...")
     
     for episode in tqdm(range(n_episodes), desc="Collecting enhanced data"):
-        density_idx = min(episode // 30, len(density_schedule) - 1)
+        # Set density for this episode
+        density_idx = min(episode // 30, len(density_schedule) - 1)  # Change every 30 eps
         current_density = density_schedule[density_idx]
         
+        # Update config
         config = base_config.copy()
         config.update({
             "initial_vehicle_count": current_density,
-            "spawn_probability": 0.1 + 0.025 * current_density,
+            "spawn_probability": 0.1 + 0.025 * current_density,  # Scale spawn with density
         })
         env.unwrapped.config.update(config)
         
         obs, info = env.reset(seed=episode)
         done = False
         step = 0
-        max_steps = 40 * 15
+        max_steps = 40 * 15  # 40s * 15Hz
         
         while not done and step < max_steps:
+            # Get high-quality RGB frame
             rgb_frame = env.render()
-            if rgb_frame is None or getattr(rgb_frame, 'size', 0) == 0 or len(rgb_frame.shape) != 3:
-                action = env.action_space.sample()
-                obs, _, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
-                step += 1
-                continue
-
-            # Convert RGB to grayscale and resize for CLIP
-            frame_gray = (0.2989 * rgb_frame[..., 0] + 0.5870 * rgb_frame[..., 1] + 0.1140 * rgb_frame[..., 2])
-            frame_gray = np.clip(frame_gray, 0, 255).astype(np.uint8)
-            pil_gray = Image.fromarray(frame_gray).resize((224, 224), resample=Image.BILINEAR).convert('L')
-
-            # Save RGB (600x600) and grayscale (224x224)
-            pil_rgb = Image.fromarray(rgb_frame)
-            gray_img_path = os.path.join(gray_img_dir, f"ep{episode:03d}_t{step:03d}_d{current_density}.png")
-            rgb_img_path = os.path.join(rgb_img_dir, f"ep{episode:03d}_t{step:03d}_d{current_density}.png")
-            try:
-                pil_gray.save(gray_img_path, format='PNG', optimize=True)
-            except Exception:
-                pil_gray.save(gray_img_path)
-            try:
-                pil_rgb.save(rgb_img_path, format='PNG', quality=95, optimize=True)
-            except Exception:
-                pil_rgb.save(rgb_img_path)
-
-            if use_dle and dle is not None:
-                description, action_phrase = dle.describe(env)
-            else:
-                ego = env.unwrapped.vehicle
-                if ego is not None:
-                    speed = ego.speed
-                    nearby_vehicles = len([v for v in env.unwrapped.road.vehicles 
-                                         if v is not ego and np.linalg.norm(v.position - ego.position) < 25])
-                    if nearby_vehicles >= current_density * 0.5 and speed > 6:
-                        description = f"heavy traffic ({current_density} vehicles nearby); slow down and be cautious"
-                    elif nearby_vehicles < 2 and speed < 4:
-                        description = f"light traffic ({current_density} vehicles); speed up and go faster"
-                    else:
-                        description = f"moderate traffic ({current_density} vehicles); maintain current speed"
-                    action_phrase = description.split("action:")[-1].strip() if "action:" in description else "maintain current speed"
+            
+            if rgb_frame is not None and len(rgb_frame.shape) == 3:
+                # Generate rich description using Ollama if requested and available,
+                # otherwise fall back to the Enhanced DLE or a lightweight heuristic.
+                if use_ollama and OLLAMA_AVAILABLE:
+                    try:
+                        description, action_phrase = generate_description_with_ollama(env)
+                    except Exception as e:
+                        print(f"Ollama generation failed: {e}; falling back to DLE/heuristic")
+                        if use_dle and dle is not None:
+                            description, action_phrase = dle.describe(env)
+                        else:
+                            description, action_phrase = _heuristic_description(env, current_density)
+                elif use_dle and dle is not None:
+                    description, action_phrase = dle.describe(env)
                 else:
-                    description = f"intersection with {current_density} expected vehicles; maintain safe speed"
-                    action_phrase = "maintain current speed"
-
-            dataset.append({
-                "image_rgb": rgb_img_path,
-                "image_gray": gray_img_path,
-                "description": description,
-                "action": action_phrase,
-                "episode": episode,
-                "step": step,
-                "density": current_density,
-                "ego_speed": float(env.unwrapped.vehicle.speed) if env.unwrapped.vehicle else 0.0
-            })
-
-            if step == 0:
-                try:
-                    print(f"DEBUG IMG: rgb={rgb_img_path} size={pil_rgb.size} "
-                          f"min={int(rgb_frame.min())} max={int(rgb_frame.max())} | "
-                          f"gray={gray_img_path} size={pil_gray.size}")
-                except Exception:
-                    pass
-
+                    description, action_phrase = _heuristic_description(env, current_density)
+                
+                # Save high-quality image
+                img = Image.fromarray(rgb_frame)
+                img_filename = f"ep{episode:03d}_t{step:03d}_d{density_schedule[density_idx]}.png"
+                img_path = os.path.join(img_dir, img_filename)
+                img.save(img_path, quality=95, optimize=True)
+                
+                dataset.append({
+                    "image": img_path,
+                    "description": description,
+                    "action": action_phrase,
+                    "episode": episode,
+                    "step": step,
+                    "density": current_density,
+                    "ego_speed": float(env.unwrapped.vehicle.speed) if env.unwrapped.vehicle else 0.0
+                })
+            
+            # Random action for exploration
             action = env.action_space.sample()
-            obs, _, terminated, truncated, _ = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             step += 1
-
+        
+        # Progress indicator
         if episode % 100 == 0:
             print(f"Episode {episode}: Collected {len(dataset)} samples | "
                   f"Current density: {current_density}")
-
+    
+    # Save dataset
     with open(save_path, 'w') as f:
         json.dump(dataset, f, indent=2)
-
+    
     print(f"\n✅ Enhanced dataset saved to {save_path}")
     print(f"📈 Total samples: {len(dataset)} across {n_episodes} episodes")
     print(f"🎯 Density distribution: {min(density_schedule):d}-{max(density_schedule):d} vehicles")
-    print(f"🖼️  RGB images saved to: {rgb_img_dir}/ (600x600)")
-    print(f"🖼️  Grayscale images saved to: {gray_img_dir}/ (224x224)")
+    print(f"🖼️  Images saved to: {img_dir}/ (600x600 RGB, high quality)")
     
     if use_dle:
         print("📝 Descriptions generated with Enhanced Data Language Encoder (directional)")
     
     env.close()
     return dataset
+
+
+def _heuristic_description(env, current_density):
+    """Simple fallback heuristic used when neither DLE nor Ollama are available."""
+    ego = env.unwrapped.vehicle
+    if ego is not None:
+        try:
+            speed = ego.speed
+        except Exception:
+            speed = 0.0
+        try:
+            nearby_vehicles = len([v for v in env.unwrapped.road.vehicles 
+                                   if v is not ego and np.linalg.norm(v.position - ego.position) < 25])
+        except Exception:
+            nearby_vehicles = 0
+
+        if nearby_vehicles >= current_density * 0.5 and speed > 6:
+            description = f"heavy traffic ({current_density} vehicles nearby); slow down and be cautious"
+            action_phrase = "slow down and be cautious"
+        elif nearby_vehicles < 2 and speed < 4:
+            description = f"light traffic ({current_density} vehicles); speed up and go faster"
+            action_phrase = "speed up and go faster"
+        else:
+            description = f"moderate traffic ({current_density} vehicles); maintain current speed"
+            action_phrase = "maintain current speed"
+    else:
+        description = f"intersection with {current_density} expected vehicles; maintain safe speed"
+        action_phrase = "maintain current speed"
+    return description, action_phrase
+
+
+def generate_description_with_ollama(env, model='llama3.1:8b', timeout=60):
+    """Generate a one-line description and action using the Ollama LLM (best-effort).
+
+    Returns (description, action) where action is one of the three canonical phrases.
+    """
+    # Build a compact context
+    ego = env.unwrapped.vehicle
+    ego_speed = float(ego.speed) if ego is not None else 0.0
+    nearby = 0
+    density = env.unwrapped.config.get('initial_vehicle_count', 0) if hasattr(env.unwrapped, 'config') else 0
+    try:
+        if hasattr(env.unwrapped, 'road') and hasattr(env.unwrapped.road, 'vehicles') and ego is not None:
+            nearby = len([v for v in env.unwrapped.road.vehicles if v is not ego and np.linalg.norm(v.position - ego.position) < 25])
+    except Exception:
+        nearby = 0
+
+    prompt = f"""You are a driving instructor for an unsignalized intersection scenario.
+Generate a short description and one exact action.
+Allowed actions (exact): 'slow down and be cautious', 'maintain current speed', 'speed up and go faster'.
+Context: ego_speed={ego_speed:.1f} m/s, nearby={nearby}, density={density}.
+Output exactly:
+Description: <one sentence>
+Action: <one of the three exact phrases>
+"""
+
+    resp = ollama.chat(model=model, messages=[{'role': 'user', 'content': prompt}], timeout=timeout)
+    # Best-effort parsing
+    if isinstance(resp, dict):
+        text = resp.get('message', {}).get('content', '')
+    else:
+        text = str(resp)
+    text = text.strip()
+    lower = text.lower()
+    if 'slow down and be cautious' in lower:
+        action = 'slow down and be cautious'
+    elif 'speed up and go faster' in lower:
+        action = 'speed up and go faster'
+    else:
+        action = 'maintain current speed'
+
+    # Extract description before the Action: marker if present
+    if 'action:' in lower:
+        try:
+            desc = text.split('Action:')[0]
+            desc = desc.replace('Description:', '').strip()
+        except Exception:
+            desc = text
+    else:
+        desc = text
+
+    return desc, action
 
 # ============================================================================
 # PART 11: Complete Enhanced Pipeline
@@ -1832,8 +1781,8 @@ def main_enhanced_pipeline():
     N_SEEDS = 3  # Run multiple seeds for robustness
     
     # Pipeline flags
-    COLLECT_DATA = False
-    FINETUNE_CLIP = False
+    COLLECT_DATA = True
+    FINETUNE_CLIP = True
     TRAIN_DQN = True
     TRAIN_PPO = True  # Focus on DQN first (better per paper)
     EVALUATE_VANILLA = True
@@ -1896,7 +1845,7 @@ def main_enhanced_pipeline():
         ft.train(
             dataset_path=data_path,
             epochs=15,
-            batch_size=256,      # Increased batch size to improve contrastive negatives
+            batch_size=4,      # Reduced batch size for stability
             save_path=clip_path,
             weight_decay=1e-5
         )
@@ -1910,11 +1859,7 @@ def main_enhanced_pipeline():
         print("\n🔍 Quick CLIP validation:")
         for i in range(3):
             sample = dataset[i]
-            img_path = sample.get('image_gray') or sample.get('image') or sample.get('image_rgb')
-            if img_path is None:
-                print(f"Sample {i}: no image key found; keys={list(sample.keys())}")
-                continue
-            img = Image.open(img_path)
+            img = Image.open(sample['image'])
             frame = np.array(img.resize((224, 224)))
             r_clip, best_act, conf, probs = test_rm.score(frame)
             action_names = ["SLOW", "IDLE", "FAST"]
@@ -2078,18 +2023,80 @@ def main_enhanced_pipeline():
     }
 
 if __name__ == "__main__":
-    # Run the complete enhanced pipeline
-    results = main_enhanced_pipeline()
-    
-    # Quick test run (uncomment to test components individually)
-    # 
+    # Provide a small CLI so this single-file script can run pipeline or utilities
+    parser = argparse.ArgumentParser(description="Enhanced CLIP-RLDrive pipeline and utilities")
+    sub = parser.add_subparsers(dest='command', required=False)
+
+    # pipeline command (default)
+    p_pipeline = sub.add_parser('pipeline', help='Run the full enhanced pipeline (default)')
+
+    # oversample command
+    p_over = sub.add_parser('oversample', help='Oversample minority action entries in dataset JSON')
+    p_over.add_argument('--input', default='enhanced_intersection_dataset.json', help='Input dataset JSON')
+    p_over.add_argument('--output', default='enhanced_intersection_dataset_oversampled.json', help='Output dataset JSON')
+    p_over.add_argument('--action', required=True, help='Action string to oversample (case-insensitive exact match)')
+    p_over.add_argument('--multiplier', type=int, default=10, help='Replication multiplier for matching entries')
+    p_over.add_argument('--no-shuffle', dest='shuffle', action='store_false', help='Do not shuffle output entries')
+    p_over.add_argument('--seed', type=int, default=42, help='Random seed for shuffling')
+
+    # collect command
+    p_collect = sub.add_parser('collect', help='Collect enhanced intersection dataset')
+    p_collect.add_argument('--n-episodes', type=int, default=500, help='Number of episodes to collect')
+    p_collect.add_argument('--save-path', type=str, default='enhanced_intersection_dataset.json', help='Path to save collected dataset')
+    p_collect.add_argument('--use-dle', action='store_true', dest='use_dle', help='Use Enhanced DLE for descriptions')
+    p_collect.add_argument('--no-dle', action='store_false', dest='use_dle')
+    p_collect.set_defaults(use_dle=True)
+    p_collect.add_argument('--use-ollama', action='store_true', dest='use_ollama', help='Use local Ollama LLM for description generation')
+    p_collect.add_argument('--no-ollama', action='store_false', dest='use_ollama')
+    p_collect.set_defaults(use_ollama=False)
+
+    args = parser.parse_args()
+
+    def oversample_dataset(input_path: Path, output_path: Path, action_value: str, multiplier: int = 10, shuffle: bool = True, seed: int = 42):
+        """Duplicate entries matching `action_value` (case-insensitive exact) multiplier times and write output JSON."""
+        input_path = Path(input_path)
+        output_path = Path(output_path)
+        if not input_path.exists():
+            raise SystemExit(f"Input file not found: {input_path}")
+        with input_path.open('r') as f:
+            data = json.load(f)
+        total = len(data)
+        matches = [d for d in data if (d.get('action') or '').strip().lower() == action_value.strip().lower()]
+        if not matches:
+            print(f"No entries found with action='{action_value}'. Nothing to do.")
+            return
+        print(f"Found {len(matches)} matching entries out of {total} total.")
+        duplicates = []
+        for _ in range(max(1, multiplier) - 1):
+            duplicates.extend([dict(d) for d in matches])
+        new_data = data + duplicates
+        if shuffle:
+            random.seed(seed)
+            random.shuffle(new_data)
+        with output_path.open('w') as f:
+            json.dump(new_data, f, indent=2)
+        print(f"Wrote oversampled dataset to {output_path} (size: {len(new_data)} ; multiplier: {multiplier})")
+
+    if args.command == 'oversample':
+        oversample_dataset(args.input, args.output, args.action, args.multiplier, args.shuffle, args.seed)
+    elif args.command == 'collect':
+        print(f"Collecting {args.n_episodes} episodes (use_dle={args.use_dle}, use_ollama={args.use_ollama})")
+        dataset = collect_enhanced_intersection_data(n_episodes=args.n_episodes, save_path=args.save_path,
+                                                     use_dle=args.use_dle, curriculum_densities=True,
+                                                     use_ollama=args.use_ollama)
+        # collect_enhanced_intersection_data already writes the file, but ensure saved
+        if dataset is not None:
+            print(f"Saved {len(dataset)} samples to {args.save_path}")
+    else:
+        # default: run pipeline
+        results = main_enhanced_pipeline()
+
+    # Quick test run examples (uncomment to use manually)
     # # Test data collection only
     # dataset = collect_enhanced_intersection_data(n_episodes=50, save_path="test_data.json")
-    # 
-    # # Test CLIP fine-tuning only  
-    # ft = EnhancedCLIPFineTuner()
+    # # Test CLIP fine-tuning only
+    # ft = RobustCLIPFineTuner()
     # ft.train("test_data.json", epochs=5, save_path="test_clip.pt")
-    # 
     # # Test single DQN run
     # model, env_fn = train_enhanced_dqn("test_clip.pt", total_timesteps=50000)
     # evaluate_enhanced_agent(model, n_episodes=20)
