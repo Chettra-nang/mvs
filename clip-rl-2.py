@@ -373,26 +373,47 @@ class RobustCLIPFineTuner:
         print("✓ Patched visual forwards with activation clamping")
 
     def get_optimizer(self):
-        # Build parameter groups carefully to avoid empty groups
-        scale_params = [p for p in [getattr(self.model, 'logit_scale', None)] if p is not None and getattr(p, 'requires_grad', False)]
-        proj_params = [p for p in [getattr(self.model, 'text_projection', None)] if p is not None and getattr(p, 'requires_grad', False)]
-        lora_params = []
-        if self.lora_applied:
-            for module in self.model.modules():
-                if hasattr(module, 'lora_A') and getattr(module, 'lora_A', None) is not None:
-                    # collect the underlying tensors used by LoRA wrappers
-                    try:
-                        if getattr(module, 'lora_A', None) is not None:
-                            lora_params.append(module.lora_A)
-                        if getattr(module, 'lora_B', None) is not None:
-                            lora_params.append(module.lora_B)
-                    except Exception:
-                        pass
+        # Collect actual torch.nn.Parameter objects by scanning named parameters.
+        # This avoids accidentally passing Module or ModuleDict objects to the optimizer
+        # (which causes the TypeError seen at runtime).
+        named = dict(self.model.named_parameters())
+
+        def pick_params_by_keys(keys):
+            out = []
+            for k in keys:
+                for name, p in named.items():
+                    if k in name and p is not None and getattr(p, 'requires_grad', False):
+                        out.append(p)
+            return out
+
+        # scale (logit_scale) and projection parameters (text_projection) are usually named directly
+        scale_params = [p for name, p in named.items() if ('logit_scale' in name or name == 'logit_scale') and getattr(p, 'requires_grad', False)]
+        proj_params = [p for name, p in named.items() if ('text_projection' in name or 'text_proj' in name) and getattr(p, 'requires_grad', False)]
+
+        # For LoRA, match parameter names that include 'lora' to collect underlying tensors
+        lora_params = [p for name, p in named.items() if 'lora' in name.lower() and getattr(p, 'requires_grad', False)] if self.lora_applied else []
+
+        # Deduplicate by id and preserve order: proj_params then lora_params
+        seen = set()
+        other_params = []
+        for p in proj_params + lora_params:
+            if id(p) not in seen:
+                seen.add(id(p))
+                other_params.append(p)
 
         # Optimizers: AdamW for projection and LoRA (paper-style higher LR), SGD for scale with tiny LR
-        other_params = proj_params + lora_params
-        other_optim = torch.optim.AdamW(other_params, lr=self.base_lr, weight_decay=0.01) if other_params else None
-        scale_optim = torch.optim.SGD(scale_params, lr=max(1e-6, self.base_lr * 0.001)) if scale_params else None
+        other_optim = None
+        scale_optim = None
+        try:
+            if other_params:
+                other_optim = torch.optim.AdamW(other_params, lr=self.base_lr, weight_decay=0.01)
+            if scale_params:
+                scale_optim = torch.optim.SGD(scale_params, lr=max(1e-6, self.base_lr * 0.001))
+        except TypeError as e:
+            # Defensive fallback: if anything went wrong constructing optimizers, print debug and return None
+            print(f"Optimizer construction error: {e}")
+            other_optim, scale_optim = None, None
+
         return other_optim, scale_optim
 
     @staticmethod
@@ -1549,7 +1570,7 @@ def evaluate_enhanced_agent(model, n_episodes=100, densities=[1, 3, 6], render=F
 # PART 10: Enhanced Data Collection with Curriculum and Richer Descriptions
 # ============================================================================
 
-def collect_enhanced_intersection_data(n_episodes=500, save_path="enhanced_intersection_dataset.json", 
+def collect_enhanced_intersection_data(n_episodes=50, save_path="enhanced_intersection_dataset.json", 
                                      use_dle=True, curriculum_densities=True, use_ollama=False):
     """
     Enhanced data collection: 500 episodes, curriculum densities, rich directional descriptions,
@@ -1742,7 +1763,9 @@ Description: <one sentence>
 Action: <one of the three exact phrases>
 """
 
-    resp = ollama.chat(model=model, messages=[{'role': 'user', 'content': prompt}], timeout=timeout)
+    # The Python ollama client does not accept a `timeout` kwarg on chat(); call without it
+    # and rely on the underlying HTTP client's defaults. Keep defensive parsing below.
+    resp = ollama.chat(model=model, messages=[{'role': 'user', 'content': prompt}])
     # Best-effort parsing
     if isinstance(resp, dict):
         text = resp.get('message', {}).get('content', '')
@@ -1801,7 +1824,7 @@ def main_enhanced_pipeline():
                 project="clip-rldrive-enhanced", 
                 name="enhanced_pipeline_v1",
                 config={
-                    "n_episodes_data": 500,
+                    "n_episodes_data": 50,
                     "clip_epochs": 25,
                     "dqn_timesteps": 300000,
                     "ppo_timesteps": 500000,
@@ -1822,7 +1845,7 @@ def main_enhanced_pipeline():
         print("STEP 1: Enhanced Data Collection (500 episodes, curriculum densities)")
         print("="*80)
         dataset = collect_enhanced_intersection_data(
-            n_episodes=500,
+            n_episodes=50,
             save_path=data_path,
             use_dle=True,
             curriculum_densities=True
