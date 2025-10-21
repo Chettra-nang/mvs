@@ -1055,7 +1055,7 @@ def create_enhanced_intersection_env(use_clip_reward=True, clip_reward_model=Non
         env.unwrapped.config.update({
             "observation": {
                 "type": "GrayscaleObservation",
-                "observation_shape": (84, 84),      # Smaller, Atari-style
+                "shape": (84, 84),      # Smaller, Atari-style (use 'shape' key expected by wrapper)
                 "stack_size": 4,                    # 4-frame stack
                 "weights": [0.2989, 0.5870, 0.1140], # RGB to grayscale
             },
@@ -1395,10 +1395,10 @@ def evaluate_enhanced_agent(model, n_episodes=100, densities=[1, 3, 6], render=F
             env = gym.make("intersection-v1", render_mode="rgb_array" if render else None)
             env.unwrapped.config.update({
                 "observation": {
-                    "type": "GrayscaleObservation",
-                    "observation_shape": (84, 84),
-                    "stack_size": 4,
-                },
+                        "type": "GrayscaleObservation",
+                        "shape": (84, 84),
+                        "stack_size": 4,
+                    },
                 "action": {
                     "type": "DiscreteMetaAction",
                     "longitudinal": True,
