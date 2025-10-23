@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# virtualenv
+mvs_venv/
+venv/
+env/
+
+# Data and outputs
+data/
+data/images/
+runs/
+clip_checkpoints/
+
+# Pytorch / model files
+*.pt
+*.pth
+*.safetensors
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+
+# logs
+logs/

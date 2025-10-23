@@ -1,0 +1,16 @@
+# Core
+numpy
+Pillow
+tqdm
+scikit-learn
+matplotlib
+torch
+torchvision
+
+# CLIP implementation (install from git if needed)
+open_clip_torch
+
+# Optional / for RL parts
+gymnasium
+stable-baselines3
+pygame
